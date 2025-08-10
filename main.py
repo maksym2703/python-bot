@@ -10,13 +10,13 @@ from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import Updater, CommandHandler, CallbackContext
 
-# ===================== Налаштування =====================
-load_dotenv()
+# ===================== .env (override) =====================
+DOTENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
+load_dotenv(DOTENV_PATH, override=True)
 
-# Bybit (глобальні — тільки для ринку; баланс тепер по користувачу)
-API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
-API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
-TESTNET = os.getenv("BYBIT_TESTNET", "true").strip().lower() == "true"
+# ===================== Налаштування =====================
+# Bybit: свічки беруться з цього прапорця; баланс іде за режимом користувача (/link)
+TESTNET = os.getenv("BYBIT_TESTNET", "false").strip().lower() == "true"
 
 # Telegram
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -25,11 +25,11 @@ TG_CHAT_ID = int(TG_CHAT_ID_STR) if TG_CHAT_ID_STR.isdigit() else None
 
 # Аналітика / алерти
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT").strip()
-INTERVAL = os.getenv("INTERVAL", "1").strip()  # "1","3","5","15","60","240","D"
+INTERVAL = os.getenv("INTERVAL", "240").strip()  # "1","3","5","15","60","240","D"
 CANDLES_LIMIT = int(os.getenv("LIMIT", "200"))
 EPS_PCT = float(os.getenv("EPS_PCT", "0.008"))  # 0.8%
 ALERT_PCT = float(os.getenv("ALERT_PCT", "0.002"))  # 0.2%
-PING_SECONDS = int(os.getenv("PING_SECONDS", "60"))
+PING_SECONDS = int(os.getenv("PING_SECONDS", "14400"))  # дефолт 4 години
 
 if not TG_TOKEN or TG_CHAT_ID is None:
     raise RuntimeError("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID не задані або некоректні в .env")
@@ -37,13 +37,14 @@ if not TG_TOKEN or TG_CHAT_ID is None:
 # Публічна сесія для свічок (без ключів)
 public_session = HTTP(testnet=TESTNET)
 
-# ===================== SQLite (ключі користувачів) =====================
+# ===================== SQLite (ключі + whitelist/ACL) =====================
 DB_PATH = os.path.join(os.path.dirname(__file__), "users.db")
 
 
 def db_init():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
+    # ключі користувачів
     cur.execute("""
                 CREATE TABLE IF NOT EXISTS users
                 (
@@ -72,6 +73,24 @@ def db_init():
                 ))
                     )
                 """)
+    # whitelist (ACL)
+    cur.execute("""
+                CREATE TABLE IF NOT EXISTS acl
+                (
+                    user_id
+                    INTEGER
+                    PRIMARY
+                    KEY,
+                    role
+                    TEXT
+                    NOT
+                    NULL
+                    DEFAULT
+                    'user' -- 'admin' або 'user'
+                )
+                """)
+    # власник бота з .env — адміністратор за замовчуванням
+    cur.execute("INSERT OR IGNORE INTO acl(user_id, role) VALUES(?, 'admin')", (TG_CHAT_ID,))
     con.commit()
     con.close()
 
@@ -98,7 +117,40 @@ def get_user(user_id: int):
     return None
 
 
-# ===================== Хелпери =====================
+def allow_user(user_id: int, role: str = "user"):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("REPLACE INTO acl(user_id, role) VALUES(?,?)", (user_id, role))
+    con.commit()
+    con.close()
+
+
+def deny_user(user_id: int):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM acl WHERE user_id=?", (user_id,))
+    con.commit()
+    con.close()
+
+
+def get_role(user_id: int) -> str:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT role FROM acl WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    con.close()
+    return row[0] if row else ""
+
+
+def is_admin(user_id: int) -> bool:
+    return get_role(user_id) == "admin"
+
+
+def is_allowed(user_id: int) -> bool:
+    return get_role(user_id) in ("user", "admin")
+
+
+# ===================== Хелпери аналітики =====================
 def fmt(n):
     try:
         return f"{float(n):,.4f}".replace(",", " ")
@@ -177,11 +229,9 @@ def get_usdt_balance_for(user_id: int):
             usdt = next((c for c in coins if c.get("coin") == "USDT"), None)
             if usdt is not None:
                 return float(usdt.get("walletBalance", 0.0))
-        except FailedRequestError as e:
-            print(f"[balance] {acct} FailedRequestError: {e}")
+        except FailedRequestError:
             continue
-        except Exception as e:
-            print(f"[balance] {acct} error: {e}")
+        except Exception:
             continue
     return None
 
@@ -189,14 +239,16 @@ def get_usdt_balance_for(user_id: int):
 # ===================== Команди =====================
 def cmd_start(update: Update, context: CallbackContext):
     text = (
-        "✅ Бот запущений.\n"
+        "Привіт! Я бот для піків Bybit.\n"
+        f"Символ: {SYMBOL}, інтервал: {INTERVAL}m\n\n"
         "Команди:\n"
-        "/now — ціна + піки\n"
+        "/now — ціна зараз + піки\n"
         "/peaks — топові мін/макс\n"
-        "/balance — твій баланс USDT (після /link)\n"
-        "/link <API_KEY> <API_SECRET> [testnet|live]\n"
-        "/unlink — прибрати ключі\n"
-        "/me — показати, чи збережені ключі\n"
+        "/balance — баланс USDT (доступ за списком + /link)\n"
+        "/link <API_KEY> <API_SECRET> [testnet|live] — зберегти ключі (лише для дозволених)\n"
+        "/unlink — прибрати свої ключі\n"
+        "/me — показати свій статус\n\n"
+        "Адмін: /allow <user_id>, /deny <user_id>\n"
     )
     update.message.reply_text(text)
 
@@ -222,8 +274,29 @@ def cmd_peaks(update: Update, context: CallbackContext):
     )
 
 
+def cmd_me(update: Update, context: CallbackContext):
+    uid = update.effective_user.id
+    u = get_user(uid)
+    role = get_role(uid) or "none"
+    allowed = "так" if is_allowed(uid) else "ні"
+    if not u:
+        update.message.reply_text(
+            f"👤 user_id: {uid}\n🔐 ключі: нема\n✅ доступ: {allowed}\n📜 роль: {role}\n"
+            f"Щоб отримати доступ — надішли цей user_id адміну (див. /allow)."
+        )
+    else:
+        update.message.reply_text(
+            f"👤 user_id: {uid}\n🔐 ключі: збережені\n🌐 режим: {'TESTNET' if u['testnet'] else 'LIVE'}\n"
+            f"✅ доступ: {allowed}\n📜 роль: {role}"
+        )
+
+
 def cmd_balance(update: Update, context: CallbackContext):
-    usdt = get_usdt_balance_for(update.effective_user.id)
+    uid = update.effective_user.id
+    if not is_allowed(uid):
+        update.message.reply_text("⛔ Немає доступу. Попроси адміна додати тебе: /allow <твій id> (див. /me)")
+        return
+    usdt = get_usdt_balance_for(uid)
     if usdt is None:
         update.message.reply_text("⚠️ Нема ключів або доступу. Спершу: /link <API_KEY> <API_SECRET> [testnet|live]")
     else:
@@ -231,6 +304,10 @@ def cmd_balance(update: Update, context: CallbackContext):
 
 
 def cmd_link(update: Update, context: CallbackContext):
+    uid = update.effective_user.id
+    if not is_allowed(uid):
+        update.message.reply_text("⛔ Немає доступу. Попроси адміна: /allow <твій id> (див. /me)")
+        return
     args = context.args
     if len(args) < 2:
         update.message.reply_text("Формат: /link <API_KEY> <API_SECRET> [testnet|live]")
@@ -238,14 +315,15 @@ def cmd_link(update: Update, context: CallbackContext):
     api_key, api_secret = args[0], args[1]
     mode = args[2].lower() if len(args) >= 3 else "testnet"
     testnet = (mode != "live")
-    save_user(update.effective_user.id, api_key, api_secret, testnet)
+    save_user(uid, api_key, api_secret, testnet)
     update.message.reply_text(
-        f"✅ Ключі збережено для @{update.effective_user.username or update.effective_user.id}. "
+        f"✅ Ключі збережено для @{update.effective_user.username or uid}. "
         f"Режим: {'TESTNET' if testnet else 'LIVE'}"
     )
 
 
 def cmd_unlink(update: Update, context: CallbackContext):
+    # дозвіл не потрібен — кожен може прибрати СВОЇ ключі
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("DELETE FROM users WHERE user_id=?", (update.effective_user.id,))
@@ -254,19 +332,37 @@ def cmd_unlink(update: Update, context: CallbackContext):
     update.message.reply_text("🗑 Ключі видалено.")
 
 
-def cmd_me(update: Update, context: CallbackContext):
-    u = get_user(update.effective_user.id)
-    if not u:
-        update.message.reply_text("ℹ️ Ключів не збережено. Використай /link …")
-    else:
-        update.message.reply_text(
-            f"👤 user_id: {update.effective_user.id}\n"
-            f"🔐 ключі: збережені\n"
-            f"🌐 режим: {'TESTNET' if u['testnet'] else 'LIVE'}"
-        )
+def cmd_allow(update: Update, context: CallbackContext):
+    if not is_admin(update.effective_user.id):
+        update.message.reply_text("⛔ Тільки адмін може додавати користувачів.")
+        return
+    if not context.args:
+        update.message.reply_text("Формат: /allow <telegram_user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+        allow_user(uid, "user")
+        update.message.reply_text(f"✅ Доступ надано для user_id={uid}")
+    except Exception:
+        update.message.reply_text("Невірний user_id.")
 
 
-# ===================== Алерти =====================
+def cmd_deny(update: Update, context: CallbackContext):
+    if not is_admin(update.effective_user.id):
+        update.message.reply_text("⛔ Тільки адмін може забирати доступ.")
+        return
+    if not context.args:
+        update.message.reply_text("Формат: /deny <telegram_user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+        deny_user(uid)
+        update.message.reply_text(f"🗑 Доступ прибрано для user_id={uid}")
+    except Exception:
+        update.message.reply_text("Невірний user_id.")
+
+
+# ===================== Алерти (для адміна з .env) =====================
 _last_alert_signature = None
 
 
@@ -292,7 +388,7 @@ def alert_job(context: CallbackContext):
             f"📊 {SYMBOL} {INTERVAL}m — піки (кластер {EPS_PCT * 100:.1f}%) {flag_txt}",
             f"• Мін: {fmt(min_level[0])} (x{min_level[1]})",
             f"• Макс: {fmt(max_level[0])} (x{max_level[1]})",
-            "ℹ️ Твій баланс: /balance (після /link)",
+            "ℹ️ Приватні команди: /balance (потрібен доступ /allow і /link)",
         ]
         context.bot.send_message(chat_id=TG_CHAT_ID, text="\n".join(lines))
         _last_alert_signature = signature
@@ -333,7 +429,12 @@ def main():
     dp.add_handler(CommandHandler("link", cmd_link))
     dp.add_handler(CommandHandler("unlink", cmd_unlink))
     dp.add_handler(CommandHandler("me", cmd_me))
+    dp.add_handler(CommandHandler("allow", cmd_allow))
+    dp.add_handler(CommandHandler("deny", cmd_deny))
     dp.add_error_handler(on_error)
+
+    # лог стартових значень (див. journalctl)
+    print(f"[startup] TESTNET={TESTNET} PING_SECONDS={PING_SECONDS} SYMBOL={SYMBOL} INTERVAL={INTERVAL}m")
 
     updater.job_queue.run_repeating(alert_job, interval=PING_SECONDS, first=5)
 
