@@ -1,4 +1,5 @@
 import os
+import sqlite3
 from datetime import datetime
 from statistics import median
 
@@ -7,12 +8,12 @@ from pybit.exceptions import FailedRequestError
 from pybit.unified_trading import HTTP
 from telegram import Update
 from telegram.error import TelegramError
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import Updater, CommandHandler, CallbackContext
 
 # ===================== Налаштування =====================
 load_dotenv()
 
-# Bybit
+# Bybit (глобальні — тільки для ринку; баланс тепер по користувачу)
 API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 TESTNET = os.getenv("BYBIT_TESTNET", "true").strip().lower() == "true"
@@ -26,15 +27,75 @@ TG_CHAT_ID = int(TG_CHAT_ID_STR) if TG_CHAT_ID_STR.isdigit() else None
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT").strip()
 INTERVAL = os.getenv("INTERVAL", "1").strip()  # "1","3","5","15","60","240","D"
 CANDLES_LIMIT = int(os.getenv("LIMIT", "200"))
-EPS_PCT = float(os.getenv("EPS_PCT", "0.008"))  # 0.8% кластеризація піків
-ALERT_PCT = float(os.getenv("ALERT_PCT", "0.002"))  # 0.2% близькість до рівня
+EPS_PCT = float(os.getenv("EPS_PCT", "0.008"))  # 0.8%
+ALERT_PCT = float(os.getenv("ALERT_PCT", "0.002"))  # 0.2%
 PING_SECONDS = int(os.getenv("PING_SECONDS", "60"))
 
 if not TG_TOKEN or TG_CHAT_ID is None:
     raise RuntimeError("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID не задані або некоректні в .env")
 
-# Bybit session: важливо передати testnet=TESTNET
-session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
+# Публічна сесія для свічок (без ключів)
+public_session = HTTP(testnet=TESTNET)
+
+# ===================== SQLite (ключі користувачів) =====================
+DB_PATH = os.path.join(os.path.dirname(__file__), "users.db")
+
+
+def db_init():
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+                CREATE TABLE IF NOT EXISTS users
+                (
+                    user_id
+                    INTEGER
+                    PRIMARY
+                    KEY,
+                    api_key
+                    TEXT
+                    NOT
+                    NULL,
+                    api_secret
+                    TEXT
+                    NOT
+                    NULL,
+                    testnet
+                    INTEGER
+                    NOT
+                    NULL
+                    CHECK (
+                    testnet
+                    IN
+                (
+                    0,
+                    1
+                ))
+                    )
+                """)
+    con.commit()
+    con.close()
+
+
+def save_user(user_id: int, api_key: str, api_secret: str, testnet: bool):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "REPLACE INTO users(user_id, api_key, api_secret, testnet) VALUES (?,?,?,?)",
+        (user_id, api_key.strip(), api_secret.strip(), 1 if testnet else 0),
+    )
+    con.commit()
+    con.close()
+
+
+def get_user(user_id: int):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT api_key, api_secret, testnet FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    con.close()
+    if row:
+        return {"api_key": row[0], "api_secret": row[1], "testnet": bool(row[2])}
+    return None
 
 
 # ===================== Хелпери =====================
@@ -46,11 +107,8 @@ def fmt(n):
 
 
 def fetch_klines(symbol: str, interval: str, limit: int):
-    """
-    Bybit V5 Spot kline: повертає список словників (свічок), відсортований за часом.
-    Елемент list: [start, open, high, low, close, volume, turnover]
-    """
-    r = session.get_kline(category="spot", symbol=symbol, interval=interval, limit=limit)
+    """Bybit V5 Spot kline → список свічок (за часом зрост.)."""
+    r = public_session.get_kline(category="spot", symbol=symbol, interval=interval, limit=limit)
     raw = r["result"]["list"]
     kl = []
     for it in raw:
@@ -61,7 +119,7 @@ def fetch_klines(symbol: str, interval: str, limit: int):
 
 
 def local_extrema(kl):
-    """Прості локальні міні/максі за 3-свічковим правилом."""
+    """Локальні міні/максі за 3-свічковим правилом."""
     lows, highs = [], []
     for i in range(1, len(kl) - 1):
         if kl[i]["low"] <= kl[i - 1]["low"] and kl[i]["low"] <= kl[i + 1]["low"]:
@@ -72,7 +130,7 @@ def local_extrema(kl):
 
 
 def cluster_levels(values, eps_pct: float):
-    """Групує близькі значення (±eps_pct) у кластери. Повертає [(медіана, кількість), ...] за спаданням частоти."""
+    """Кластеризація значень (±eps_pct) → [(медіана, кількість), ...] за частотою."""
     if not values:
         return []
     values = sorted(values)
@@ -89,7 +147,7 @@ def cluster_levels(values, eps_pct: float):
 
 
 def find_peak_levels(symbol: str, interval: str, limit: int, eps_pct: float):
-    """Повертає (top_min, top_max, last_close). top_* = (price, count)."""
+    """→ (top_min, top_max, last_close), де top_* = (price, count)."""
     kl = fetch_klines(symbol, interval, limit)
     lows, highs = local_extrema(kl)
     low_clusters = cluster_levels(lows, eps_pct)
@@ -100,34 +158,50 @@ def find_peak_levels(symbol: str, interval: str, limit: int, eps_pct: float):
     return best_min, best_max, last_close
 
 
-def get_usdt_balance():
+def get_usdt_balance_for(user_id: int):
     """
-    Повертає float (баланс) або None, якщо авторизація не пройшла (401 / IP whitelist / права).
+    Баланс для конкретного юзера. Пробуємо UNIFIED → SPOT → CONTRACT.
+    Повертає float або None.
     """
-    try:
-        r = session.get_wallet_balance(accountType="UNIFIED")
-        coins = r["result"]["list"][0]["coin"]
-        usdt = next((c for c in coins if c["coin"] == "USDT"), None)
-        return float(usdt["walletBalance"]) if usdt else 0.0
-    except FailedRequestError:
+    u = get_user(user_id)
+    if not u:
         return None
-    except Exception:
-        return None
+    ses = HTTP(testnet=u["testnet"], api_key=u["api_key"], api_secret=u["api_secret"])
+    for acct in ("UNIFIED", "SPOT", "CONTRACT"):
+        try:
+            r = ses.get_wallet_balance(accountType=acct)
+            lst = r.get("result", {}).get("list", [])
+            if not lst:
+                continue
+            coins = lst[0].get("coin", [])
+            usdt = next((c for c in coins if c.get("coin") == "USDT"), None)
+            if usdt is not None:
+                return float(usdt.get("walletBalance", 0.0))
+        except FailedRequestError as e:
+            print(f"[balance] {acct} FailedRequestError: {e}")
+            continue
+        except Exception as e:
+            print(f"[balance] {acct} error: {e}")
+            continue
+    return None
 
 
-# ===================== Telegram-команди =====================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===================== Команди =====================
+def cmd_start(update: Update, context: CallbackContext):
     text = (
         "✅ Бот запущений.\n"
         "Команди:\n"
-        "/now — ціна + піки зараз\n"
+        "/now — ціна + піки\n"
         "/peaks — топові мін/макс\n"
-        "/balance — баланс USDT\n"
+        "/balance — твій баланс USDT (після /link)\n"
+        "/link <API_KEY> <API_SECRET> [testnet|live]\n"
+        "/unlink — прибрати ключі\n"
+        "/me — показати, чи збережені ключі\n"
     )
-    await update.message.reply_text(text)
+    update.message.reply_text(text)
 
 
-async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def cmd_now(update: Update, context: CallbackContext):
     min_level, max_level, price = find_peak_levels(SYMBOL, INTERVAL, CANDLES_LIMIT, EPS_PCT)
     text = (
         f"⏱ {datetime.now():%Y-%m-%d %H:%M:%S}\n"
@@ -136,44 +210,76 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Мін:  {fmt(min_level[0])} (x{min_level[1]})\n"
         f"• Макс: {fmt(max_level[0])} (x{max_level[1]})"
     )
-    await update.message.reply_text(text)
+    update.message.reply_text(text)
 
 
-async def cmd_peaks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def cmd_peaks(update: Update, context: CallbackContext):
     min_level, max_level, _ = find_peak_levels(SYMBOL, INTERVAL, CANDLES_LIMIT, EPS_PCT)
-    await update.message.reply_text(
+    update.message.reply_text(
         f"📈 Піки (кластер {EPS_PCT * 100:.1f}%):\n"
         f"• Мін:  {fmt(min_level[0])} (x{min_level[1]})\n"
         f"• Макс: {fmt(max_level[0])} (x{max_level[1]})"
     )
 
 
-async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    usdt = get_usdt_balance()
+def cmd_balance(update: Update, context: CallbackContext):
+    usdt = get_usdt_balance_for(update.effective_user.id)
     if usdt is None:
-        await update.message.reply_text("⚠️ Баланс недоступний: перевір ключі/права/IP і BYBIT_TESTNET у .env")
+        update.message.reply_text("⚠️ Нема ключів або доступу. Спершу: /link <API_KEY> <API_SECRET> [testnet|live]")
     else:
-        await update.message.reply_text(f"💰 Баланс USDT: {fmt(usdt)}")
+        update.message.reply_text(f"💰 Баланс USDT: {fmt(usdt)}")
 
 
-# ===================== Anti-duplicate для алертів =====================
-_last_alert_signature = None  # (min_price, min_cnt, max_price, max_cnt, usdt)
+def cmd_link(update: Update, context: CallbackContext):
+    args = context.args
+    if len(args) < 2:
+        update.message.reply_text("Формат: /link <API_KEY> <API_SECRET> [testnet|live]")
+        return
+    api_key, api_secret = args[0], args[1]
+    mode = args[2].lower() if len(args) >= 3 else "testnet"
+    testnet = (mode != "live")
+    save_user(update.effective_user.id, api_key, api_secret, testnet)
+    update.message.reply_text(
+        f"✅ Ключі збережено для @{update.effective_user.username or update.effective_user.id}. "
+        f"Режим: {'TESTNET' if testnet else 'LIVE'}"
+    )
 
 
-# ===================== Фоновий алерт =====================
-async def alert_job(context: ContextTypes.DEFAULT_TYPE):
+def cmd_unlink(update: Update, context: CallbackContext):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM users WHERE user_id=?", (update.effective_user.id,))
+    con.commit()
+    con.close()
+    update.message.reply_text("🗑 Ключі видалено.")
+
+
+def cmd_me(update: Update, context: CallbackContext):
+    u = get_user(update.effective_user.id)
+    if not u:
+        update.message.reply_text("ℹ️ Ключів не збережено. Використай /link …")
+    else:
+        update.message.reply_text(
+            f"👤 user_id: {update.effective_user.id}\n"
+            f"🔐 ключі: збережені\n"
+            f"🌐 режим: {'TESTNET' if u['testnet'] else 'LIVE'}"
+        )
+
+
+# ===================== Алерти =====================
+_last_alert_signature = None
+
+
+def alert_job(context: CallbackContext):
     global _last_alert_signature
     try:
         min_level, max_level, price = find_peak_levels(SYMBOL, INTERVAL, CANDLES_LIMIT, EPS_PCT)
-        usdt = get_usdt_balance()
-
         signature = (
-            round(min_level[0] or 0, 2), int(min_level[1] or 0),
-            round(max_level[0] or 0, 2), int(max_level[1] or 0),
-            round(usdt or 0, 2)
+            round((min_level[0] or 0), 2), int(min_level[1] or 0),
+            round((max_level[0] or 0), 2), int(max_level[1] or 0)
         )
         if signature == _last_alert_signature:
-            return  # не дублюємо те саме
+            return
 
         near_min = price and min_level[0] and abs(price - min_level[0]) / min_level[0] <= ALERT_PCT
         near_max = price and max_level[0] and abs(price - max_level[0]) / max_level[0] <= ALERT_PCT
@@ -186,55 +292,53 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             f"📊 {SYMBOL} {INTERVAL}m — піки (кластер {EPS_PCT * 100:.1f}%) {flag_txt}",
             f"• Мін: {fmt(min_level[0])} (x{min_level[1]})",
             f"• Макс: {fmt(max_level[0])} (x{max_level[1]})",
+            "ℹ️ Твій баланс: /balance (після /link)",
         ]
-        if usdt is not None:
-            lines.append(f"💰 Баланс USDT: {fmt(usdt)}")
-        else:
-            lines.append("⚠️ Баланс недоступний: перевір ключі Testnet/Live, права Read, IP whitelist")
-
-        await context.bot.send_message(chat_id=TG_CHAT_ID, text="\n".join(lines))
+        context.bot.send_message(chat_id=TG_CHAT_ID, text="\n".join(lines))
         _last_alert_signature = signature
-
     except Exception as e:
         if TG_CHAT_ID:
-            await context.bot.send_message(chat_id=TG_CHAT_ID, text=f"⚠️ Помилка алерту: {e}")
+            context.bot.send_message(chat_id=TG_CHAT_ID, text=f"⚠️ Помилка алерту: {e}")
 
 
-# ===================== Обробка помилок =====================
-async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+# ===================== Error handler =====================
+def on_error(update, context: CallbackContext):
     try:
         raise context.error
     except TelegramError as e:
         if TG_CHAT_ID:
-            await context.bot.send_message(chat_id=TG_CHAT_ID, text=f"⚠️ Telegram error: {e}")
+            context.bot.send_message(chat_id=TG_CHAT_ID, text=f"⚠️ Telegram error: {e}")
     except Exception as e:
         if TG_CHAT_ID:
-            await context.bot.send_message(chat_id=TG_CHAT_ID, text=f"⚠️ Error: {e}")
+            context.bot.send_message(chat_id=TG_CHAT_ID, text=f"⚠️ Error: {e}")
 
 
-# ===================== Ініціалізація =====================
-async def on_startup(app):
-    # прибираємо webhook, щоб не було 409 Conflict
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    # одна (!) job для алертів
-    app.job_queue.run_repeating(alert_job, interval=PING_SECONDS, first=5)
-
-
+# ===================== Запуск =====================
 def main():
-    app = (
-        ApplicationBuilder()
-        .token(TG_TOKEN)
-        .post_init(on_startup)
-        .build()
-    )
+    db_init()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("now", cmd_now))
-    app.add_handler(CommandHandler("peaks", cmd_peaks))
-    app.add_handler(CommandHandler("balance", cmd_balance))
-    app.add_error_handler(on_error)
+    updater = Updater(TG_TOKEN)
+    bot = updater.bot
 
-    app.run_polling(close_loop=False)
+    try:
+        bot.delete_webhook()
+    except Exception:
+        pass
+
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler("start", cmd_start))
+    dp.add_handler(CommandHandler("now", cmd_now))
+    dp.add_handler(CommandHandler("peaks", cmd_peaks))
+    dp.add_handler(CommandHandler("balance", cmd_balance))
+    dp.add_handler(CommandHandler("link", cmd_link))
+    dp.add_handler(CommandHandler("unlink", cmd_unlink))
+    dp.add_handler(CommandHandler("me", cmd_me))
+    dp.add_error_handler(on_error)
+
+    updater.job_queue.run_repeating(alert_job, interval=PING_SECONDS, first=5)
+
+    updater.start_polling(drop_pending_updates=True)
+    updater.idle()
 
 
 if __name__ == "__main__":
